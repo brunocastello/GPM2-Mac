@@ -16,7 +16,7 @@ It builds for:
 
 | System | Build |
 |---|---|
-| macOS 11 or later (Intel or Apple Silicon) | `Grand Prix Manager 2.app`, universal |
+| Mac OS X 10.6 or later (Intel), macOS 11 or later (Apple Silicon) | `Grand Prix Manager 2.app`, universal |
 | Mac OS X 10.4 and 10.5 (PowerPC) | `GPM2-ppc.iso` |
 | Mac OS 9 (PowerPC, CarbonLib) | `GPM2.dsk` |
 

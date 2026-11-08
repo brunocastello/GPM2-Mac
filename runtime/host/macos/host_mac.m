@@ -16,6 +16,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <CommonCrypto/CommonDigest.h>
 
+#include "compat_mac.h"
 #include "../host.h"
 #include "../hostname_posix.h"
 #include "../../gpm2run.h"
@@ -26,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <mach/mach_time.h>
 
 extern int opt_idle_exit, opt_fixed_time_set;
 extern uint32_t opt_fixed_time;
@@ -47,24 +49,34 @@ static const char *gCliFix[16]; static int gNCliFix;   /* --fix BUG-xxx=on|off: 
 static int gCliScale, gCliFull, gCliFill; /* --scale N, --fullscreen, --fill: apply to this run only */
 static NSCursor *gCursor;
 static BOOL gCursorHidden;
+static BOOL gLegacyFull;                  /* 10.6 full screen (no native one): frameless window over the whole screen, Tiger style */
+static BOOL is_full(void) { return gWin && ((gWin.styleMask & GPM_STYLE_FULLSCREEN) || gLegacyFull); }
 
 static NSCursor *blank_cursor(void) {
     static NSCursor *c;
-    if (!c) c = [[NSCursor alloc] initWithImage:[[NSImage alloc] initWithSize:NSMakeSize(1, 1)] hotSpot:NSZeroPoint];
+    if (!c) c = [[NSCursor alloc] initWithImage:[[[NSImage alloc] initWithSize:NSMakeSize(1, 1)] autorelease] hotSpot:NSZeroPoint];   /* static: owned once */
     return c;
+}
+static void draw_hourglass(void) {
+    NSBezierPath *p = [NSBezierPath bezierPath];
+    [p moveToPoint:NSMakePoint(3, 1)]; [p lineToPoint:NSMakePoint(13, 1)]; [p lineToPoint:NSMakePoint(8.5, 8)];
+    [p lineToPoint:NSMakePoint(13, 15)]; [p lineToPoint:NSMakePoint(3, 15)]; [p lineToPoint:NSMakePoint(7.5, 8)];
+    [p closePath];
+    [[NSColor whiteColor] setFill]; [p fill];
+    [[NSColor blackColor] setStroke]; [p setLineWidth:1.2]; [p stroke];
 }
 static NSCursor *hourglass_cursor(void) {
     static NSCursor *c;
     if (!c) {
-        NSImage *im = [NSImage imageWithSize:NSMakeSize(16, 16) flipped:NO drawingHandler:^BOOL(NSRect r) {
-            NSBezierPath *p = [NSBezierPath bezierPath];
-            [p moveToPoint:NSMakePoint(3, 1)]; [p lineToPoint:NSMakePoint(13, 1)]; [p lineToPoint:NSMakePoint(8.5, 8)];
-            [p lineToPoint:NSMakePoint(13, 15)]; [p lineToPoint:NSMakePoint(3, 15)]; [p lineToPoint:NSMakePoint(7.5, 8)];
-            [p closePath];
-            [[NSColor whiteColor] setFill]; [p fill];
-            [[NSColor blackColor] setStroke]; [p setLineWidth:1.2]; [p stroke];
-            return YES;
-        }];
+        NSImage *im;
+        GPM_NEWER_BEGIN
+        if ([NSImage respondsToSelector:@selector(imageWithSize:flipped:drawingHandler:)])      /* 10.8+: resolution independent */
+            im = [NSImage imageWithSize:NSMakeSize(16, 16) flipped:NO drawingHandler:^BOOL(NSRect r) { draw_hourglass(); return YES; }];
+        else {
+            im = [[[NSImage alloc] initWithSize:NSMakeSize(16, 16)] autorelease];
+            [im lockFocus]; draw_hourglass(); [im unlockFocus];
+        }
+        GPM_NEWER_END
         c = [[NSCursor alloc] initWithImage:im hotSpot:NSMakePoint(8, 8)];
     }
     return c;
@@ -167,14 +179,14 @@ static void refresh_cursors(void) {
         _hwnd = h; _isMain = m; _gw = gw; _gh = gh;
         self.wantsLayer = YES;
         self.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
-        _imgLayer = [CALayer layer];
+        _imgLayer = [[CALayer layer] retain];
         _imgLayer.contentsGravity = kCAGravityResize;
         _imgLayer.opaque = YES;
         _imgLayer.anchorPoint = CGPointZero;
         [self.layer addSublayer:_imgLayer];
-        [self addTrackingArea:[[NSTrackingArea alloc] initWithRect:NSZeroRect
-            options:NSTrackingMouseMoved | NSTrackingActiveInActiveApp | NSTrackingInVisibleRect | NSTrackingCursorUpdate owner:self userInfo:nil]];
-        if (!gViews) gViews = [NSMutableArray array];
+        [self addTrackingArea:[[[NSTrackingArea alloc] initWithRect:NSZeroRect
+            options:NSTrackingMouseMoved | NSTrackingActiveInActiveApp | NSTrackingInVisibleRect | NSTrackingCursorUpdate owner:self userInfo:nil] autorelease]];
+        if (!gViews) gViews = [[NSMutableArray alloc] init];   /* static: owned once */
         [gViews addObject:self];
     }
     return self;
@@ -183,6 +195,8 @@ static void refresh_cursors(void) {
     [gViews removeObject:self];
     if (_raw) CGImageRelease(_raw);
     if (_up) CGImageRelease(_up);
+    [_imgLayer release];
+    [super dealloc];
 }
 - (BOOL)isFlipped { return YES; }
 - (BOOL)acceptsFirstResponder { return YES; }
@@ -194,19 +208,33 @@ static void refresh_cursors(void) {
 - (CGFloat)scale {
     NSSize b = self.bounds.size;
     if (!_isMain) return _gw > 0 ? b.width / _gw : 1;
-    CGFloat bs = self.window.backingScaleFactor ?: 1, s = MIN(b.width / _gw, b.height / _gh);
-    if ((self.window.styleMask & NSWindowStyleMaskFullScreen) && gFullMode == 0) s = floor(s * bs + 1e-6) / bs;
+    CGFloat bs = gpm_backing_scale(self.window), s = MIN(b.width / _gw, b.height / _gh);
+    if (is_full() && gFullMode == 0) s = floor(s * bs + 1e-6) / bs;
     return s < 1 ? 1 : s;
 }
 - (NSRect)imgRect {
     if (!_isMain) return self.bounds;
-    if ((self.window.styleMask & NSWindowStyleMaskFullScreen) && gFullMode == 2) return self.bounds;     /* Stretch: ignores the aspect ratio */
+    if (is_full() && gFullMode == 2) return self.bounds;     /* Stretch: ignores the aspect ratio */
     CGFloat s = [self scale], w = _gw * s, h = _gh * s;
     return NSMakeRect(floor((self.bounds.size.width - w) / 2), floor((self.bounds.size.height - h) / 2), w, h);
 }
+/* 10.6: changing the window style (full screen) makes AppKit replace the view's backing layer, dropping the image layer
+ * (white window). Re-attach it whenever the backing layer changed; on 10.7+ this is a no-op. */
+- (void)attachLayers {
+    CALayer *l = self.layer;
+    if (!l || _imgLayer.superlayer == l) return;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [_imgLayer removeFromSuperlayer];
+    l.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+    [l addSublayer:_imgLayer];
+    [CATransaction commit];
+}
+- (void)viewDidMoveToWindow { [super viewDidMoveToWindow]; [self attachLayers]; }
 - (void)applyImage {
+    [self attachLayers];
     if (!_raw) return;
-    CGFloat bs = self.window.backingScaleFactor ?: 1;
+    CGFloat bs = gpm_backing_scale(self.window);
     NSRect ir = [self imgRect];
     CGFloat sx = ir.size.width / _gw * bs, sy = ir.size.height / _gh * bs, sp = MIN(sx, sy);
     BOOL integer = fabs(sx - round(sx)) < 0.01 && fabs(sy - round(sy)) < 0.01;
@@ -230,6 +258,7 @@ static void refresh_cursors(void) {
     [CATransaction commit];
 }
 - (void)relayout {
+    [self attachLayers];
     NSRect r = [self imgRect];
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
@@ -239,8 +268,20 @@ static void refresh_cursors(void) {
     [self applyImage];
 }
 - (void)setFrameSize:(NSSize)s { [super setFrameSize:s]; [self relayout]; }
-- (void)layout { [super layout]; [self relayout]; }
-- (void)viewDidChangeBackingProperties { [super viewDidChangeBackingProperties]; _imgLayer.contentsScale = self.window.backingScaleFactor; [self relayout]; }
+/* layout and viewDidChangeBackingProperties are only called from 10.7 on */
+- (void)layout {
+    GPM_NEWER_BEGIN
+    [super layout];
+    GPM_NEWER_END
+    [self relayout];
+}
+- (void)viewDidChangeBackingProperties {
+    GPM_NEWER_BEGIN
+    [super viewDidChangeBackingProperties];
+    GPM_NEWER_END
+    _imgLayer.contentsScale = gpm_backing_scale(self.window);
+    [self relayout];
+}
 - (void)setImage:(CGImageRef)img {
     if (_raw) CGImageRelease(_raw);
     _raw = CGImageRetain(img);
@@ -335,6 +376,14 @@ static HostWindow gMainInfo;
 static BOOL gHaveMain;
 static NSPanel *gPrefs;
 
+/* the main window must stay key when it is frameless (10.6 full screen) */
+@interface MainWindow : NSWindow
+@end
+@implementation MainWindow
+- (BOOL)canBecomeKeyWindow { return YES; }
+- (BOOL)canBecomeMainWindow { return YES; }
+@end
+
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
 - (void)gameMenu:(NSMenuItem *)it;
 - (void)showHelp:(id)sender;
@@ -352,7 +401,6 @@ static void push_close(uint32_t win) {
     h.type = HOST_EV_CLOSE; h.win = win;
     host_push_event(&h);
 }
-static BOOL is_full(void) { return gWin && (gWin.styleMask & NSWindowStyleMaskFullScreen); }
 
 /* largest scale (with the game's aspect ratio) whose window, with the title bar, fits the usable screen area */
 static double max_scale_for(NSScreen *scr) {
@@ -369,11 +417,11 @@ static void layout_panels(void) {
     if (!gHaveMain || !gWin || !gView.window) return;
     NSRect ir = [gView imgRect];
     CGFloat s = ir.size.width / GAME_W, sy = ir.size.height / GAME_H;
-    NSPoint tl = [gWin convertPointToScreen:[gView convertPoint:ir.origin toView:nil]];   /* top-left corner of the image */
+    NSPoint tl = gpm_to_screen(gWin, [gView convertPoint:ir.origin toView:nil]);   /* top-left corner of the image */
     for (NSNumber *k in gPanels) {
-        NSPanel *p = gPanels[k];
+        NSPanel *p = [gPanels objectForKey:k];
         HostWindow w;
-        [gInfos[k] getBytes:&w length:sizeof w];
+        [[gInfos objectForKey:k] getBytes:&w length:sizeof w];
         CGFloat cw = w.cw * s, ch = w.ch * sy;
         CGFloat x = tl.x + ((w.x + w.cx) - (gMainInfo.x + gMainInfo.cx)) * s;
         CGFloat top = tl.y - ((w.y + w.cy) - (gMainInfo.y + gMainInfo.cy)) * sy;
@@ -385,15 +433,15 @@ static void layout_panels(void) {
 static void order_panels(void) {
     NSArray *keys = [gPanels.allKeys sortedArrayUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
         HostWindow x, y;
-        [gInfos[a] getBytes:&x length:sizeof x]; [gInfos[b] getBytes:&y length:sizeof y];
+        [[gInfos objectForKey:a] getBytes:&x length:sizeof x]; [[gInfos objectForKey:b] getBytes:&y length:sizeof y];
         if (x.topmost != y.topmost) return x.topmost < y.topmost ? NSOrderedAscending : NSOrderedDescending;
         return x.z < y.z ? NSOrderedAscending : x.z > y.z ? NSOrderedDescending : NSOrderedSame;
     }];
-    for (NSNumber *k in keys) if (gPanels[k].isVisible) [gPanels[k] orderFront:nil];
+    for (NSNumber *k in keys) if ([[gPanels objectForKey:k] isVisible]) [[gPanels objectForKey:k] orderFront:nil];
 }
 static GameView *view_for_hwnd(uint32_t id) {
     if (gHaveMain && id == gMainInfo.id) return gView;
-    return (GameView *)gPanels[@(id)].contentView;
+    return (GameView *)[[gPanels objectForKey:@(id)] contentView];
 }
 
 /* guest top-level window (created, moved, shown, hidden...) -> main thread */
@@ -407,24 +455,24 @@ static void apply_window(HostWindow w) {                        /* a child windo
 }
 static void apply_window_inner(HostWindow w) {
     NSNumber *key = @(w.id);
-    if (!gInfos) { gInfos = [NSMutableDictionary dictionary]; gPanels = [NSMutableDictionary dictionary]; }
-    gInfos[key] = [NSData dataWithBytes:&w length:sizeof w];
+    if (!gInfos) { gInfos = [[NSMutableDictionary alloc] init]; gPanels = [[NSMutableDictionary alloc] init]; }
+    [gInfos setObject:[NSData dataWithBytes:&w length:sizeof w] forKey:key];
     if (w.main) { gMainInfo = w; gHaveMain = YES; layout_panels(); return; }
-    NSPanel *p = gPanels[key];
+    NSPanel *p = [gPanels objectForKey:key];
     if (!w.visible || w.cw <= 0 || w.ch <= 0) { [p orderOut:nil]; return; }
     NSString *title = [NSString stringWithCString:w.title encoding:NSWindowsCP1252StringEncoding] ?: @"";
     if (!p) {
         NSWindowStyleMask st = w.caption ? (NSWindowStyleMaskTitled | (w.sysmenu ? NSWindowStyleMaskClosable : 0)) : NSWindowStyleMaskBorderless;
-        p = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, w.cw, w.ch) styleMask:st backing:NSBackingStoreBuffered defer:NO];
+        p = [[[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, w.cw, w.ch) styleMask:st backing:NSBackingStoreBuffered defer:NO] autorelease];
         p.releasedWhenClosed = NO;
         p.hidesOnDeactivate = NO;
         p.becomesKeyOnlyIfNeeded = NO;
         p.acceptsMouseMovedEvents = YES;
         p.delegate = gDelegate;
-        p.collectionBehavior = NSWindowCollectionBehaviorFullScreenAuxiliary;
-        GameView *v = [[GameView alloc] initWithFrame:NSMakeRect(0, 0, w.cw, w.ch) hwnd:w.id main:NO gw:w.cw gh:w.ch];
+        if (gpm_native_fullscreen()) p.collectionBehavior = GPM_FS_AUXILIARY;
+        GameView *v = [[[GameView alloc] initWithFrame:NSMakeRect(0, 0, w.cw, w.ch) hwnd:w.id main:NO gw:w.cw gh:w.ch] autorelease];
         p.contentView = v;
-        gPanels[key] = p;
+        [gPanels setObject:p forKey:key];
         [gWin addChildWindow:p ordered:NSWindowAbove];        /* follows the main window; always stays above it */
     }
     GameView *v = (GameView *)p.contentView;
@@ -437,8 +485,8 @@ static void apply_window_inner(HostWindow w) {
 }
 static void remove_window(uint32_t id) {
     NSNumber *key = @(id);
-    NSPanel *p = gPanels[key];
-    if (p) { [gWin removeChildWindow:p]; [p orderOut:nil]; [p close]; [gPanels removeObjectForKey:key]; }
+    NSPanel *p = [[[gPanels objectForKey:key] retain] autorelease];       /* alive until the end of this event */
+    if (p) { [gViews removeObject:p.contentView]; [gWin removeChildWindow:p]; [p orderOut:nil]; [p close]; [gPanels removeObjectForKey:key]; }
     [gInfos removeObjectForKey:key];
     if (gHaveMain && id == gMainInfo.id) gHaveMain = NO;
 }
@@ -462,6 +510,47 @@ static void resize_content(CGFloat w, CGFloat h) {
 /* the size items go up to 2x even if the usable screen does not fit it (the window is kept visible by keep_on_screen) */
 static double menu_max_scale(void) { return gMaxScale < 2 ? 2 : gMaxScale; }
 static void refresh_prefs(void);
+/* Full screen without the native one (10.6): like the Tiger/PPC build, a frameless window covers the whole main screen, the Dock is
+ * hidden and the menu bar auto-hides (shows when the mouse hits the top); black background, no resolution change.
+ * Pixel Perfect / Fill / Stretch: see GameView imgRect. */
+static NSRect gSavedFrame;
+static void layout_panels(void);
+static void legacy_full(BOOL on) {
+    if (!gWin || on == gLegacyFull) return;
+    gLegacyFull = on;
+    if (on) {
+        gSavedFrame = gWin.frame;
+        [gWin setStyleMask:NSWindowStyleMaskBorderless];
+        [gWin setFrame:[[NSScreen mainScreen] frame] display:YES animate:NO];
+        [NSApp setPresentationOptions:NSApplicationPresentationHideDock | NSApplicationPresentationAutoHideMenuBar];
+        [gWin setBackgroundColor:[NSColor blackColor]];
+    } else {
+        [NSApp setPresentationOptions:NSApplicationPresentationDefault];
+        [gWin setStyleMask:WIN_STYLE];
+        [gWin setBackgroundColor:[NSColor windowBackgroundColor]];
+        [gWin setFrame:gSavedFrame display:YES animate:NO];
+        NSString *t = [[gWin.title copy] autorelease];         /* 10.6: the rebuilt title bar comes back empty; set the title again */
+        gWin.title = @"";
+        gWin.title = t.length ? t : @"Grand Prix Manager 2";
+    }
+    [gWin makeKeyAndOrderFront:nil];
+    [gWin makeFirstResponder:gView];
+    [gView setWantsLayer:YES];                                /* the style change may have dropped the backing layer */
+    [gView relayout];
+    layout_panels();
+}
+static void apply_scale(double s, BOOL persist);
+static void toggle_full_screen(void) {
+    if (gpm_native_fullscreen()) {
+        GPM_NEWER_BEGIN
+        [gWin toggleFullScreen:nil];
+        GPM_NEWER_END
+    } else {
+        legacy_full(!gLegacyFull);
+        if (!gLegacyFull) apply_scale(gScale, NO);
+        refresh_prefs();
+    }
+}
 static void apply_scale(double s, BOOL persist) {
     gScale = s < 1 ? 1 : s > menu_max_scale() ? menu_max_scale() : s;
     if (persist) [[NSUserDefaults standardUserDefaults] setDouble:gScale forKey:@"ViewScale"];
@@ -482,7 +571,7 @@ static NSMenuItem *gChatTop;                                  /* Chat menu: gray
     NSDictionary *d = it.representedObject;
     HostEvent h;
     memset(&h, 0, sizeof h);
-    h.type = HOST_EV_MENU; h.a = [d[@"id"] intValue]; h.b = [d[@"sys"] intValue];
+    h.type = HOST_EV_MENU; h.a = [[d objectForKey:@"id"] intValue]; h.b = [[d objectForKey:@"sys"] intValue];
     host_push_event(&h);
 }
 - (void)chatShow:(id)sender { HostEvent h; memset(&h, 0, sizeof h); h.type = HOST_EV_CHAT; h.a = 0; host_push_event(&h); }
@@ -497,7 +586,7 @@ static NSMenuItem *gChatTop;                                  /* Chat menu: gray
 - (void)requestClose:(id)sender { push_close(0); }
 - (void)setScaleFromMenu:(NSMenuItem *)it { apply_scale(it.tag / 10.0, YES); }          /* tag = scale x 10 */
 - (void)zoomToFit:(id)sender { apply_scale(gMaxScale, YES); }
-- (void)toggleFull:(id)sender { [gWin toggleFullScreen:nil]; }
+- (void)toggleFull:(id)sender { toggle_full_screen(); }
 - (void)setFullMode:(NSMenuItem *)it { set_full_mode((int)it.tag, YES); }
 - (BOOL)validateMenuItem:(NSMenuItem *)it {
     SEL a = it.action;
@@ -534,15 +623,15 @@ static NSMenuItem *gChatTop;                                  /* Chat menu: gray
 @end
 
 static NSMenuItem *submenu_item(NSString *title, NSMenu *sub) {
-    NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:title action:nil keyEquivalent:@""];
+    NSMenuItem *it = [[[NSMenuItem alloc] initWithTitle:title action:nil keyEquivalent:@""] autorelease];
     sub.title = title;
     it.submenu = sub;
     return it;
 }
 static void build_main_menu(void) {
-    NSMenu *main = [[NSMenu alloc] initWithTitle:@""];
+    NSMenu *main = [[[NSMenu alloc] initWithTitle:@""] autorelease];
     NSString *name = @"Grand Prix Manager 2";
-    NSMenu *app = [[NSMenu alloc] initWithTitle:name];
+    NSMenu *app = [[[NSMenu alloc] initWithTitle:name] autorelease];
     NSMenuItem *ab = [app addItemWithTitle:@"About Grand Prix Manager 2" action:@selector(showAbout:) keyEquivalent:@""];
     ab.target = gDelegate;
     [app addItem:[NSMenuItem separatorItem]];
@@ -558,8 +647,8 @@ static void build_main_menu(void) {
     q.target = gDelegate;
     [main addItem:submenu_item(name, app)];
 
-    NSMenu *view = [[NSMenu alloc] initWithTitle:@"View"];
-    NSMenu *wsz = [[NSMenu alloc] initWithTitle:@"Window Size"];
+    NSMenu *view = [[[NSMenu alloc] initWithTitle:@"View"] autorelease];
+    NSMenu *wsz = [[[NSMenu alloc] initWithTitle:@"Window Size"] autorelease];
     for (int t10 = 10; t10 <= (int)(menu_max_scale() * 10 + 1e-6); t10 += (t10 == 10 ? 5 : t10 == 15 ? 5 : 10)) {      /* 1x, 1.5x, 2x, 3x ... */
         NSString *t = t10 == 10 ? @"Actual Size (1×)" : t10 % 10 ? [NSString stringWithFormat:@"%.1f×", t10 / 10.0] : [NSString stringWithFormat:@"%d×", t10 / 10];
         NSMenuItem *it = [wsz addItemWithTitle:t action:@selector(setScaleFromMenu:) keyEquivalent:(t10 % 10 == 0 && t10 <= 40) ? [NSString stringWithFormat:@"%d", t10 / 10] : @""];
@@ -573,30 +662,30 @@ static void build_main_menu(void) {
     NSMenuItem *fs = [view addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFull:) keyEquivalent:@"f"];
     fs.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagControl;
     fs.target = gDelegate;
-    NSMenu *fm = [[NSMenu alloc] initWithTitle:@"Full Screen Mode"];
+    NSMenu *fm = [[[NSMenu alloc] initWithTitle:@"Full Screen Mode"] autorelease];
     NSMenuItem *pp = [fm addItemWithTitle:@"Pixel Perfect" action:@selector(setFullMode:) keyEquivalent:@""];
     pp.target = gDelegate; pp.tag = 0;
     NSMenuItem *fl = [fm addItemWithTitle:@"Fill Screen" action:@selector(setFullMode:) keyEquivalent:@""];
     fl.target = gDelegate; fl.tag = 1;
     NSMenuItem *st = [fm addItemWithTitle:@"Stretch" action:@selector(setFullMode:) keyEquivalent:@""];
     st.target = gDelegate; st.tag = 2;
-    NSMenuItem *fmi = [[NSMenuItem alloc] initWithTitle:@"Full Screen Mode" action:nil keyEquivalent:@""];
+    NSMenuItem *fmi = [[[NSMenuItem alloc] initWithTitle:@"Full Screen Mode" action:nil keyEquivalent:@""] autorelease];
     fmi.submenu = fm;
     [view addItem:fmi];
     [main addItem:submenu_item(@"View", view)];
 
-    NSMenu *chat = [[NSMenu alloc] initWithTitle:@"Chat"];
+    NSMenu *chat = [[[NSMenu alloc] initWithTitle:@"Chat"] autorelease];
     chat.autoenablesItems = NO;
     [chat addItemWithTitle:@"Show Chat" action:@selector(chatShow:) keyEquivalent:@""].target = gDelegate;
     [chat addItemWithTitle:@"Chat Settings\u2026" action:@selector(chatSettings:) keyEquivalent:@""].target = gDelegate;
-    gChatTop = submenu_item(@"Chat", chat);
+    gChatTop = [submenu_item(@"Chat", chat) retain];
     gChatTop.enabled = NO;
     main.autoenablesItems = NO;                                   /* top-level items only: the Chat title is grayed out without Link Play */
     [main addItem:gChatTop];
-    NSMenu *win = [[NSMenu alloc] initWithTitle:@"Window"];
+    NSMenu *win = [[[NSMenu alloc] initWithTitle:@"Window"] autorelease];
     [win addItemWithTitle:@"Minimize" action:@selector(performMiniaturize:) keyEquivalent:@"m"];
     [main addItem:submenu_item(@"Window", win)];
-    NSMenu *help = [[NSMenu alloc] initWithTitle:@"Help"];
+    NSMenu *help = [[[NSMenu alloc] initWithTitle:@"Help"] autorelease];
     NSMenuItem *hi = [help addItemWithTitle:@"Grand Prix Manager 2 Help" action:@selector(showHelp:) keyEquivalent:@"?"];
     hi.target = gDelegate;
     [main addItem:submenu_item(@"Help", help)];
@@ -613,15 +702,15 @@ static NSDictionary *item_dict(const HostMenuItem *m, int sys) {
              @"popup": @(m->nchild > 0)};
 }
 static NSMenu *menu_from(NSString *title, NSArray *items) {
-    NSMenu *m = [[NSMenu alloc] initWithTitle:title];
+    NSMenu *m = [[[NSMenu alloc] initWithTitle:title] autorelease];
     m.autoenablesItems = NO;
     for (NSDictionary *d in items) {
-        if ([d[@"sep"] boolValue]) { [m addItem:[NSMenuItem separatorItem]]; continue; }
-        NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:d[@"title"] action:nil keyEquivalent:@""];
-        if ([d[@"popup"] boolValue]) it.submenu = menu_from(d[@"title"], d[@"kids"]);
+        if ([[d objectForKey:@"sep"] boolValue]) { [m addItem:[NSMenuItem separatorItem]]; continue; }
+        NSMenuItem *it = [[[NSMenuItem alloc] initWithTitle:[d objectForKey:@"title"] action:nil keyEquivalent:@""] autorelease];
+        if ([[d objectForKey:@"popup"] boolValue]) it.submenu = menu_from([d objectForKey:@"title"], [d objectForKey:@"kids"]);
         else { it.action = @selector(gameMenu:); it.target = gDelegate; it.representedObject = d; }
-        it.enabled = ![d[@"gray"] boolValue];
-        it.state = [d[@"check"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+        it.enabled = ![[d objectForKey:@"gray"] boolValue];
+        it.state = [[d objectForKey:@"check"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
         [m addItem:it];
     }
     return m;
@@ -629,21 +718,24 @@ static NSMenu *menu_from(NSString *title, NSArray *items) {
 void host_chat_menu_enable(int on) { dispatch_async(dispatch_get_main_queue(), ^{ gChatTop.enabled = on != 0; }); }
 void host_computer_name(char *out, size_t cap) { hostname_short(out, cap); }
 void host_set_menu(const HostMenuItem *top, int n, int sys) {
+  @autoreleasepool {
     NSMutableArray *tops = [NSMutableArray array];
     for (int i = 0; i < n; i++) [tops addObject:item_dict(&top[i], sys)];
     dispatch_async(dispatch_get_main_queue(), ^{
         NSMenu *main = [NSApp mainMenu];
         if (!main) return;
         for (NSMenuItem *it in gGameItems) [main removeItem:it];
-        gGameItems = [NSMutableArray array];
+        [gGameItems release];
+        gGameItems = [[NSMutableArray alloc] init];
         NSInteger at = 1;
         for (NSDictionary *d in tops) {
-            NSArray *kids = d[@"kids"];
-            NSMenuItem *it = submenu_item(d[@"title"], menu_from(d[@"title"], kids));
+            NSArray *kids = [d objectForKey:@"kids"];
+            NSMenuItem *it = submenu_item([d objectForKey:@"title"], menu_from([d objectForKey:@"title"], kids));
             [main insertItem:it atIndex:at++];
             [gGameItems addObject:it];
         }
     });
+  }
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -661,7 +753,7 @@ static void refresh_prefs(void) {
     gPrefFolder.stringValue = gCfg.game ? @(gCfg.game) : ([[NSUserDefaults standardUserDefaults] stringForKey:@"GameFolder"] ?: @"");
 }
 static NSTextField *label_at(NSString *t, NSRect r) {
-    NSTextField *l = [NSTextField labelWithString:t];
+    NSTextField *l = gpm_label(t, NO);
     l.frame = r;
     l.alignment = NSTextAlignmentRight;
     return l;
@@ -673,10 +765,10 @@ static void show_prefs(void) {
         gPrefs.title = @"Settings";
         gPrefs.releasedWhenClosed = NO;
         gPrefs.hidesOnDeactivate = NO;
-        NSTabView *tabs = [[NSTabView alloc] initWithFrame:NSMakeRect(16, 16, 500, 250)];
+        NSTabView *tabs = [[[NSTabView alloc] initWithFrame:NSMakeRect(16, 16, 500, 250)] autorelease];
         [gPrefs.contentView addSubview:tabs];
-        NSView *c = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 478, 200)];
-        NSTabViewItem *general = [[NSTabViewItem alloc] initWithIdentifier:@"general"];
+        NSView *c = [[[NSView alloc] initWithFrame:NSMakeRect(0, 0, 478, 200)] autorelease];
+        NSTabViewItem *general = [[[NSTabViewItem alloc] initWithIdentifier:@"general"] autorelease];
         general.label = @"General";
         general.view = c;
         [tabs addTabViewItem:general];
@@ -695,15 +787,15 @@ static void show_prefs(void) {
         [gPrefFull addItemWithTitle:@"Stretch"]; gPrefFull.lastItem.tag = 2;
         gPrefFull.target = gDelegate; gPrefFull.action = @selector(prefFullMode:);
         [c addSubview:gPrefFull];
-        gPrefOpenFull = [NSButton checkboxWithTitle:@"Open in full screen" target:gDelegate action:@selector(prefOpenFull:)];
+        gPrefOpenFull = [gpm_checkbox(@"Open in full screen", gDelegate, @selector(prefOpenFull:)) retain];
         gPrefOpenFull.frame = NSMakeRect(148, 70, 250, 22);
         [c addSubview:gPrefOpenFull];
         [c addSubview:label_at(@"Game folder:", NSMakeRect(10, 36, 130, 20))];
-        gPrefFolder = [NSTextField labelWithString:@""];
+        gPrefFolder = [gpm_label(@"", NO) retain];
         gPrefFolder.frame = NSMakeRect(150, 36, 230, 20);
-        gPrefFolder.lineBreakMode = NSLineBreakByTruncatingMiddle;
+        [[gPrefFolder cell] setLineBreakMode:NSLineBreakByTruncatingMiddle];
         [c addSubview:gPrefFolder];
-        NSButton *ch = [NSButton buttonWithTitle:@"Change…" target:gDelegate action:@selector(prefFolder:)];
+        NSButton *ch = gpm_button(@"Change…", gDelegate, @selector(prefFolder:));
         ch.frame = NSMakeRect(386, 32, 84, 28);
         [c addSubview:ch];
         [gPrefs center];
@@ -751,8 +843,10 @@ void host_present(uint32_t win, const uint8_t *pix, int w, int h, const uint8_t 
     CGImageRef img = CGImageCreate((size_t)w, (size_t)h, 8, 32, (size_t)w * 4, srgb(), (CGBitmapInfo)kCGImageAlphaNoneSkipLast, prov, NULL, false, kCGRenderingIntentDefault);
     CGDataProviderRelease(prov);
     pthread_mutex_lock(&frame_mu);
-    if (!gPending) gPending = [NSMutableDictionary dictionary];
-    gPending[@(win)] = (__bridge id)img;                      /* the dictionary retains the image */
+    @autoreleasepool {                                        /* guest thread */
+    if (!gPending) gPending = [[NSMutableDictionary alloc] init];
+    [gPending setObject:(__bridge id)img forKey:@(win)];      /* the dictionary retains the image */
+    }
     nframes++;
     if (nframes == 1 || nframes % 25 == 0) fprintf(stderr, "[host] frame %u (%dx%d, hwnd %x)\n", nframes, w, h, win);
     int need = !frame_scheduled;
@@ -762,16 +856,19 @@ void host_present(uint32_t win, const uint8_t *pix, int w, int h, const uint8_t 
     if (need)
         dispatch_async(dispatch_get_main_queue(), ^{
             pthread_mutex_lock(&frame_mu);
-            NSDictionary *d = gPending;
+            NSDictionary *d = gPending;                       /* ownership passes to d */
             gPending = nil;
             frame_scheduled = 0;
             pthread_mutex_unlock(&frame_mu);
-            for (NSNumber *k in d) [view_for_hwnd(k.unsignedIntValue) setImage:(__bridge CGImageRef)d[k]];
+            for (NSNumber *k in d) [view_for_hwnd(k.unsignedIntValue) setImage:(__bridge CGImageRef)[d objectForKey:k]];
+            [d release];
         });
 }
 void host_set_title(const char *t) {
-    NSString *s = [NSString stringWithCString:t encoding:NSWindowsCP1252StringEncoding] ?: @"Grand Prix Manager 2";
-    dispatch_async(dispatch_get_main_queue(), ^{ gWin.title = s; });
+    @autoreleasepool {
+        NSString *s = [NSString stringWithCString:t encoding:NSWindowsCP1252StringEncoding] ?: @"Grand Prix Manager 2";
+        dispatch_async(dispatch_get_main_queue(), ^{ gWin.title = s; });
+    }
 }
 void host_set_cursor(uint32_t idc) {
     dispatch_async(dispatch_get_main_queue(), ^{ gCursor = cursor_for(idc); refresh_cursors(); });
@@ -792,30 +889,33 @@ void host_help(int context) {
         host_message_box("Help", "GPMHELP.HLP was not found in the game folder.", 0x30);
         return;
     }
-    NSString *path = @(idx);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSURL *u = [NSURL fileURLWithPath:path];
-        if (context >= 0) u = [NSURL URLWithString:[u.absoluteString stringByAppendingFormat:@"#ctx%d", context]] ?: u;
-        [[NSWorkspace sharedWorkspace] openURL:u];
-    });
+    @autoreleasepool {
+        NSString *path = @(idx);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSURL *u = [NSURL fileURLWithPath:path];
+            if (context >= 0) u = [NSURL URLWithString:[u.absoluteString stringByAppendingFormat:@"#ctx%d", context]] ?: u;
+            [[NSWorkspace sharedWorkspace] openURL:u];
+        });
+    }
 }
 int host_message_box(const char *title, const char *text, uint32_t flags) {
     __block int result = 1;
+  @autoreleasepool {
     NSString *t = [NSString stringWithCString:title encoding:NSWindowsCP1252StringEncoding] ?: @"";
     NSString *m = [NSString stringWithCString:text encoding:NSWindowsCP1252StringEncoding] ?: @"";
     void (^run)(void) = ^{
         if (flags & 0x40000000u) {                                        /* native About panel (the game's "About" window) */
-            NSMutableParagraphStyle *ps = [[NSMutableParagraphStyle alloc] init];
+            NSMutableParagraphStyle *ps = [[[NSMutableParagraphStyle alloc] init] autorelease];
             ps.alignment = NSTextAlignmentCenter;
-            NSAttributedString *cr = [[NSAttributedString alloc] initWithString:m attributes:@{NSFontAttributeName: [NSFont systemFontOfSize:11],
-                                                                                              NSParagraphStyleAttributeName: ps}];
+            NSAttributedString *cr = [[[NSAttributedString alloc] initWithString:m attributes:@{NSFontAttributeName: [NSFont systemFontOfSize:11],
+                                                                                              NSParagraphStyleAttributeName: ps}] autorelease];
             [NSApp activateIgnoringOtherApps:YES];
             [NSApp orderFrontStandardAboutPanelWithOptions:@{@"ApplicationName": @"Grand Prix Manager 2", @"Credits": cr}];
             for (NSWindow *w in NSApp.windows)                                /* centered over the main window */
-                if (w != gWin && w.visible && [w.className containsString:@"About"]) center_over_main(w);
+                if (w != gWin && w.visible && [w.className rangeOfString:@"About"].location != NSNotFound) center_over_main(w);
             return;
         }
-        NSAlert *a = [[NSAlert alloc] init];
+        NSAlert *a = [[[NSAlert alloc] init] autorelease];
         a.messageText = t;
         a.informativeText = m;
         switch (flags & 0xF0u) {
@@ -833,34 +933,37 @@ int host_message_box(const char *title, const char *text, uint32_t flags) {
         unsigned def = (flags >> 8) & 0xFu;                               /* MB_DEFBUTTONn */
         if (def >= (unsigned)n) def = 0;
         for (int i = 0; i < n; i++) {
-            NSButton *b = a.buttons[(NSUInteger)i];
+            NSButton *b = [a.buttons objectAtIndex:(NSUInteger)i];
             b.keyEquivalent = (unsigned)i == def ? @"\r" : (ids[i] == 2 ? @"\033" : @"");
         }
         [NSApp activateIgnoringOtherApps:YES];
         NSModalResponse r;
-        if (gWin && gWin.visible && !gWin.miniaturized) {                 /* as a sheet of the main window (centered on it) */
+        if (gWin && gWin.visible && !gWin.miniaturized && [a respondsToSelector:@selector(beginSheetModalForWindow:completionHandler:)]) {   /* as a sheet of the main window (centered on it); 10.9+ */
             __block NSModalResponse sr = NSAlertFirstButtonReturn;
+            GPM_NEWER_BEGIN
             [a beginSheetModalForWindow:gWin completionHandler:^(NSModalResponse rr) { sr = rr; [NSApp stopModal]; }];
+            GPM_NEWER_END
             [NSApp runModalForWindow:a.window];
             r = sr;
-        } else { r = [a runModal]; }
+        } else { r = [a runModal]; }               /* 10.6 to 10.8: application modal alert */
         int k = (int)(r - NSAlertFirstButtonReturn);
         result = k >= 0 && k < n ? ids[k] : ids[0];
     };
     if ([NSThread isMainThread]) run(); else dispatch_sync(dispatch_get_main_queue(), run);
+  }
     return result;
 }
 /* Link Play (TCP/IP): address of the other Mac, "ip" or "ip:port"; empty = LAN discovery only. Returns 0 if cancelled. */
 int host_net_ask_address(char *out, int cap) {
     __block int ok = 1;
-    NSString *env = [NSProcessInfo processInfo].environment[@"GPM2_NET_HOST"];
+    NSString *env = [[[NSProcessInfo processInfo] environment] objectForKey:@"GPM2_NET_HOST"];
     if (env) { snprintf(out, (size_t)cap, "%s", env.UTF8String); return 1; }
     void (^run)(void) = ^{
-        NSAlert *a = [[NSAlert alloc] init];
+        NSAlert *a = [[[NSAlert alloc] init] autorelease];
         a.messageText = @"TCP/IP Connection";
         a.informativeText = @"Enter the IP address of the host (leave empty to search the local network).";
         [a addButtonWithTitle:@"OK"]; [a addButtonWithTitle:@"Cancel"];
-        NSTextField *tf = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 220, 24)];
+        NSTextField *tf = [[[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 220, 24)] autorelease];
         a.accessoryView = tf;
         [NSApp activateIgnoringOtherApps:YES];
         NSModalResponse r = [a runModal];
@@ -870,7 +973,11 @@ int host_net_ask_address(char *out, int cap) {
     if ([NSThread isMainThread]) run(); else dispatch_sync(dispatch_get_main_queue(), run);
     return ok;
 }
-uint32_t host_now_ms(void) { return (uint32_t)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000ull); }
+uint32_t host_now_ms(void) {
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info(&tb);
+    return (uint32_t)((mach_absolute_time() * tb.numer / tb.denom) / 1000000ull);
+}
 void host_sleep_ms(uint32_t ms) { usleep(ms * 1000u); }
 void host_init(const char *out) { (void)out; }
 unsigned host_frame_count(void) { return nframes; }
@@ -899,7 +1006,7 @@ static NSString *exe_in_folder(NSString *dir) {
 }
 static BOOL is_game_folder(NSString *dir) { NSString *e = exe_in_folder(dir); return e && [sha256_of(e) isEqualToString:EXE_SHA256]; }
 static void alert_need_102b(NSString *dir) {
-    NSAlert *a = [[NSAlert alloc] init];
+    NSAlert *a = [[[NSAlert alloc] init] autorelease];
     a.messageText = @"This app requires Grand Prix Manager 2 version 1.02B";
     a.informativeText = exe_in_folder(dir) ? @"GPM2.EXE in the chosen folder is not version 1.02B. Install the Grand Prix Manager 2 1.02B patch, then choose the game folder again."
                                            : @"GPM2.EXE was not found in the chosen folder. Choose the folder that contains GPM2.EXE (Grand Prix Manager 2 version 1.02B).";
@@ -953,7 +1060,7 @@ static BOOL resolve_files(void) {
     NSString *g = choose_path(@"Choose the folder that contains GPM2.EXE (Grand Prix Manager 2 version 1.02B).", YES, gCfg.game ? @(gCfg.game) : [u stringForKey:@"GameFolder"]);
     if (!g) return;
     if (!is_game_folder(g)) { alert_need_102b(g); return; }
-    NSAlert *a = [[NSAlert alloc] init];
+    NSAlert *a = [[[NSAlert alloc] init] autorelease];
     [u setObject:g forKey:@"GameFolder"];
     refresh_prefs();
     a.messageText = @"Restart required";
@@ -961,7 +1068,9 @@ static BOOL resolve_files(void) {
     [a runModal];
 }
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
-    [NSWindow setAllowsAutomaticWindowTabbing:NO];
+    GPM_NEWER_BEGIN
+    if ([NSWindow respondsToSelector:@selector(setAllowsAutomaticWindowTabbing:)]) [NSWindow setAllowsAutomaticWindowTabbing:NO];
+    GPM_NEWER_END
     NSUserDefaults *u = [NSUserDefaults standardUserDefaults];
     /* all fixes always on (fix_on default); --fix for tests only */
     for (int i = 0; i < gNCliFix; i++) if (fix_parse_arg(gCliFix[i])) fprintf(stderr, "--fix: invalid argument: %s\n", gCliFix[i]);
@@ -976,12 +1085,14 @@ static BOOL resolve_files(void) {
     build_main_menu();
 
     NSRect content = NSMakeRect(0, 0, GAME_W * gScale, GAME_H * gScale);
-    gWin = [[NSWindow alloc] initWithContentRect:content styleMask:WIN_STYLE backing:NSBackingStoreBuffered defer:NO];
+    gWin = [[MainWindow alloc] initWithContentRect:content styleMask:WIN_STYLE backing:NSBackingStoreBuffered defer:NO];
     gWin.title = @"Grand Prix Manager 2";
-    gWin.tabbingMode = NSWindowTabbingModeDisallowed;
+    GPM_NEWER_BEGIN
+    if ([gWin respondsToSelector:@selector(setTabbingMode:)]) gWin.tabbingMode = NSWindowTabbingModeDisallowed;
+    GPM_NEWER_END
     gWin.delegate = self;
     gWin.acceptsMouseMovedEvents = YES;
-    gWin.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
+    if (gpm_native_fullscreen()) gWin.collectionBehavior = GPM_FS_PRIMARY;
     gWin.contentMinSize = NSMakeSize(GAME_W, GAME_H);
     gView = [[GameView alloc] initWithFrame:content hwnd:0 main:YES gw:GAME_W gh:GAME_H];
     gView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
@@ -999,13 +1110,13 @@ static BOOL resolve_files(void) {
     fprintf(stderr, "[host] game: %s\n[host] exe: %s\n[host] writable: %s\n", gCfg.game, gCfg.exe, gCfg.wdir);
     if (!gCfg.out) gCfg.out = "/tmp/gpm2-out";
     if (gpm2_start(&gCfg, &gThread)) {
-        NSAlert *a = [[NSAlert alloc] init];
+        NSAlert *a = [[[NSAlert alloc] init] autorelease];
         a.messageText = @"Could not start the game";
         a.informativeText = @"Run again with GPM2_LOG=1 (or --log) and see ~/Library/Logs/GPM2/run.log for details.";
         [a runModal];
         exit(2);
     }
-    if (gCliFull || [u boolForKey:@"OpenFullScreen"]) dispatch_async(dispatch_get_main_queue(), ^{ [gWin toggleFullScreen:nil]; });
+    if (gCliFull || [u boolForKey:@"OpenFullScreen"]) dispatch_async(dispatch_get_main_queue(), ^{ toggle_full_screen(); });
 }
 @end
 
@@ -1044,7 +1155,7 @@ int main(int argc, char **argv) {
             setvbuf(stderr, NULL, _IOLBF, 0);
         } else freopen("/dev/null", "w", stderr);
         NSApplication *app = [NSApplication sharedApplication];
-        gDelegate = [[AppDelegate alloc] init];
+        gDelegate = [[AppDelegate alloc] init];                /* static: owned once */
         app.delegate = gDelegate;
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
         [app run];

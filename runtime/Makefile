@@ -1,5 +1,5 @@
 # Builds the runtime and the generated C (gen/, from `python3 -m recomp f1 GPM2.EXE gen/`).
-#   make app       build/Grand Prix Manager 2.app, macOS 11 or later, universal
+#   make app       build/Grand Prix Manager 2.app, universal: arm64 macOS 11+, x86_64 Mac OS X 10.6+
 #   make ppc-app   Mac OS X 10.4/10.5 PowerPC (cross compiler, see the ppc-app section below)
 CC       = clang
 AR      ?= ar
@@ -50,15 +50,16 @@ ICON_SRC ?= $(firstword $(wildcard $(GAME_DIR)/GPM.ICO))
 MAC_SRC  = $(wildcard host/macos/*.m)
 MAC_OBJ  = $(addprefix $(BUILD)/lib/mac_,$(notdir $(MAC_SRC:.m=.o)))
 ARCHFLAGS ?=
-OBJCFLAGS = -fobjc-arc -O1 -g0 -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations
-MINVER   = -mmacosx-version-min=11.0
+OBJCFLAGS = -O1 -g0 -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations
+# per-architecture minimum system: arm64 starts at macOS 11, x86_64 at Mac OS X 10.6 (Snow Leopard)
+minver_for = $(if $(filter arm64,$(1)),11.0,10.6)
 app: $(APP)
 $(BUILD)/lib/mac_%.o: host/macos/%.m $(W32_HDR)
 	@mkdir -p $(dir $@)
 	$(CC) $(OBJCFLAGS) $(ARCHFLAGS) $(INC) -c -o $@ $<
 # one binary per architecture (sub-make with its own BUILD) + lipo => universal arm64+x86_64
 $(BUILD)/GPM2.%.bin: FORCE
-	$(MAKE) BUILD=$(BUILD)/$* CFLAGS="$(CFLAGS) -arch $* $(MINVER)" ARCHFLAGS="-arch $* $(MINVER)" $(BUILD)/$*/GPM2.bin
+	$(MAKE) BUILD=$(BUILD)/$* CFLAGS="$(CFLAGS) -arch $* -mmacosx-version-min=$(call minver_for,$*)" ARCHFLAGS="-arch $* -mmacosx-version-min=$(call minver_for,$*)" $(BUILD)/$*/GPM2.bin
 FORCE:
 $(BUILD)/GPM2.bin: $(MAC_OBJ) $(CORE_LIB) $(BUILD)/lib/libgpm2.a
 	$(CC) $(OBJCFLAGS) $(ARCHFLAGS) -o $@ $(MAC_OBJ) $(CORE_LIB) $(BUILD)/lib/libgpm2.a \
@@ -71,7 +72,8 @@ $(APP): $(BUILD)/GPM2.arm64.bin $(BUILD)/GPM2.x86_64.bin host/macos/Info.plist.i
 	@if [ -n "$(ICON_SRC)" ] && [ -f "$(ICON_SRC)" ] && command -v iconutil >/dev/null 2>&1; then \
 	  echo "icon: $(ICON_SRC)"; rm -rf $(BUILD)/GPM2.iconset; \
 	  python3 -I ../tools/make_icon.py "$(ICON_SRC)" $(BUILD)/GPM2.iconset $(BUILD)/icon.png && \
-	  iconutil -c icns $(BUILD)/GPM2.iconset -o $@/Contents/Resources/GPM2.icns || echo "icon: not generated"; \
+	  iconutil -c icns $(BUILD)/GPM2.iconset -o $@/Contents/Resources/GPM2.icns && \
+	  python3 -I ../tools/add_legacy_icns.py "$(ICON_SRC)" $@/Contents/Resources/GPM2.icns || echo "icon: not generated"; \
 	else echo "icon: no GPM.ICO (app without icon)"; fi
 	codesign --force --deep --sign - $@
 	rm -rf "$(BUILD)/Grand Prix Manager 2.app" && mv $@ "$(BUILD)/Grand Prix Manager 2.app"      # final name with a space; make does not handle spaces in targets well
