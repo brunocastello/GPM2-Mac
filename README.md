@@ -45,6 +45,11 @@ built from this repository contains code translated from your own copy of the ga
 - `runtime/`: the Win32 runtime in C and the native front ends (`host/macos`, `host/carbon` for
   Tiger, `host/os9`).
 - `tools/`: icon and packaging helpers.
+- `docs/plans/`: how the port was built, 01-14 in build order (recompiler, Win32 runtime, macOS,
+  Tiger and OS 9 front ends, bug hooks). They are working notes, kept as written.
+- `docs/bugs/known-bugs.md`: the catalog of known bugs in the original and which ones are fixed.
+
+A network race (Link Play between two machines) was never tested.
 
 *Grand Prix Manager 2* is © MicroProse. This project is not affiliated with MicroProse or its
 successors.
