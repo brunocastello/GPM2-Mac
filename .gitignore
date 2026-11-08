@@ -1,0 +1,10 @@
+.DS_Store
+out/
+__pycache__/
+gen/
+runtime/build/
+out*/
+runtime/host/os9/icons_gen.r
+third_party/
+bin/
+tools/os9-sdk/

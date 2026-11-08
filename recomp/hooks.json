@@ -1,0 +1,8 @@
+{
+  "exe_sha256": "266f214714b6a2d3396f969f0e142dc267b63d80beb255b9998f66ffcd253546",
+  "hooks": [
+    {"kind": "point", "va": "0x431597", "bytes": "c6459e0e", "name": "bug022_engmaker", "bug": "BUG-022"},
+    {"kind": "point", "va": "0x4ae353", "bytes": "83f801", "name": "bug024_gcfver", "bug": "BUG-024"},
+    {"kind": "point", "va": "0x4f51c6", "bytes": "8b4508", "name": "bug026_viewrestore", "bug": "BUG-026", "skip": "0x4f51d2"}
+  ]
+}
